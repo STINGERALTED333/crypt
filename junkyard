@@ -23,7 +23,7 @@ local ShiftMethod = nil
 
 local WALK_SPEED_BOOST = 11
 local TARGET_START_RADIUS = 14
-local SCRIPT_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/edit/main/junkyard-mechanic"
+local SCRIPT_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/junkyard"
 
 -- Recorded route: set WAYPOINTS_URL to the raw GitHub link of your dump file,
 -- or paste the table inline into RECORDED_WAYPOINTS (without the "return").
