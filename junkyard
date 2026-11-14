@@ -1,4 +1,3 @@
---
 local Players = game:GetService("Players")
 local PathfindingService = game:GetService("PathfindingService")
 local UserInputService = game:GetService("UserInputService")
@@ -8,7 +7,17 @@ local HttpService = game:GetService("HttpService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
 local Player = Players.LocalPlayer
+
+while not Player do
+    Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+    Player = Players.LocalPlayer
+end
+
 local Running = true
 local CurrentConnections = {}
 local PlayerControls = nil
@@ -329,8 +338,23 @@ local function ActivatePrompt(Prompt, Puddle)
         TriggerObserved = true
     end)
 
+    -- Some puddles delete or disable their prompt the moment they are used,
+    -- so that also counts as a successful interaction.
+    local function IsConsumed()
+        return TriggerObserved
+            or not Prompt.Parent
+            or not Prompt.Enabled
+            or (Puddle ~= nil and not Puddle.Parent)
+    end
+
+    local Fired = false
+
     for Attempt = 1, 3 do
-        if not Running or not Prompt.Parent or not Prompt.Enabled then
+        if not Running then
+            break
+        end
+
+        if Fired and IsConsumed() then
             break
         end
 
@@ -356,33 +380,23 @@ local function ActivatePrompt(Prompt, Puddle)
             end
         end
 
+        Fired = true
+
         local StartedAt = os.clock()
 
-        while Running and not TriggerObserved
-            and Prompt.Parent
-            and os.clock() - StartedAt < 0.5 do
-
-            if Puddle and not Puddle.Parent then
-                TriggerObserved = true
-                break
-            end
-
-            task.wait(0.05)
+        while Running and not IsConsumed() and os.clock() - StartedAt < 0.5 do
+            task.wait(0.03)
         end
 
-        if TriggerObserved or (Puddle and not Puddle.Parent) then
+        if IsConsumed() then
             break
         end
     end
 
     TriggerConnection:Disconnect()
 
-    if TriggerObserved then
+    if Fired and IsConsumed() then
         print("[Auto] Puddle interaction confirmed.")
-        return true
-    end
-
-    if Puddle and not Puddle.Parent then
         return true
     end
 
@@ -425,6 +439,27 @@ local function Stop()
 
     warn("[Auto] Stopped. Controls restored.")
 end
+
+-- Wait for the character to fully exist (important right after teleport/rejoin)
+local function WaitForCharacter()
+    while Running do
+        local Character = Player.Character
+
+        if Character
+            and Character.Parent
+            and Character:FindFirstChildOfClass("Humanoid")
+            and Character:FindFirstChild("HumanoidRootPart") then
+            return true
+        end
+
+        task.wait(0.25)
+    end
+
+    return false
+end
+
+WaitForCharacter()
+task.wait(1) -- let the game finish setting the character up
 
 HoldShift()
 SetPlayerControlsEnabled(false)
@@ -1120,26 +1155,7 @@ local function ProcessPuddle(Puddle)
 
     elseif DidIt then
         ProcessedPuddles[Puddle] = true
-
-        print("[Auto] Waiting up to 3 seconds for puddle removal.")
-
-        local RemovalStarted = os.clock()
-
-        while Running
-            and not Destroyed
-            and Puddle.Parent
-            and os.clock() - RemovalStarted < 3 do
-
-            task.wait(0.05)
-        end
-
-        if not Destroyed and Puddle.Parent then
-            IgnoredPuddles[Puddle] = true
-            ProcessedPuddles[Puddle] = true
-            print("[Auto] Puddle remained after 3 seconds. Ignoring permanently.")
-        else
-            print("[Auto] Puddle successfully removed.")
-        end
+        print("[Auto] Puddle collected.")
 
     else
         PuddleFailures[Puddle] = (PuddleFailures[Puddle] or 0) + 1
