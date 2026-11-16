@@ -1,0 +1,465 @@
+local RS = game:GetService("ReplicatedStorage")
+local APP_RELIABLE = RS:WaitForChild("AppNet"):WaitForChild("APP_RELIABLE")
+
+local function encodeDrive(id: string)
+    local len = #id
+    assert(len <= 64, "vehicle id too long")
+    local b = buffer.create(3 + len)
+    buffer.writeu8(b, 0, 43)
+    buffer.writeu16(b, 1, len)
+    buffer.writestring(b, 3, id, len)
+    return b
+end
+
+local function SpawnAsCar()
+    repeat task.wait(1) until game.Players.LocalPlayer.Character
+
+    local Car = workspace.VehicleViews:FindFirstChildOfClass("Model")
+    local ID = Car and Car:GetAttribute("GarageVehicleId")
+    if ID then
+        APP_RELIABLE:FireServer(encodeDrive(ID), {})  -- {} = instance list, empty here
+        return true
+    end
+
+    warn("[ERROR]: No car found in garage!")
+    return nil
+end
+
+SpawnAsCar()
+
+task.wait(math.random(2,6))
+-- Drive Player v3
+--   F8 start/stop. On start it loads a random numbered path file (1.txt, 2.txt, ...) from the repo,
+--   drives it with W/A/S/D at the recorded speeds, leaves the car (presses F) once it is within
+--   EXIT_RADIUS studs of the last drive waypoint, then walks (sprinting) in straight lines to the destination.
+--   While you are out of the car, LeftShift is held (sprint).
+
+local env = (getgenv and getgenv()) or _G
+if env.__DrivePlayLoaded then return end
+env.__DrivePlayLoaded = true
+
+----------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------
+local TOGGLE_KEY = Enum.KeyCode.F8
+local EXIT_KEY   = Enum.KeyCode.F
+
+-- Repo folder containing 1.txt, 2.txt, ... (no trailing slash)
+local BASE_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/BID_DRIVE_PATHS"
+local FILE_EXT = ".txt"
+local MISS_LIMIT = 2            -- stop probing after this many missing numbers in a row
+local MAX_FILES  = 200
+local ALLOW_LOCAL_FALLBACK = false   -- true = use drive_path.json if the repo fails
+local LOCAL_FALLBACK = "drive_path.json"
+
+local ALWAYS_SPRINT_OUT_OF_CAR = true
+local EXIT_RADIUS      = 10     -- studs from the last drive waypoint at which it brakes and leaves the car
+local ALWAYS_EXIT_AT_END = true -- leave the car even if the recording has no walk part
+
+-- Driving
+local SPEED_SCALE      = 1.0
+local LOOKAHEAD_MIN    = 10
+local LOOKAHEAD_SPEED  = 0.3
+local STEER_FULL_ANGLE = math.rad(35)
+local STEER_DEADZONE   = math.rad(2)
+local SPEED_RANGE      = 8
+local PWM_PERIOD       = 0.15
+-- Walking
+local WALK_SIMPLIFY    = 3      -- studs; recorded walk is straightened into lines (bigger = straighter)
+local WALK_REACH       = 3      -- studs; waypoint counts as reached
+local USE_KEYPRESS     = false  -- true = executor keypress/keyrelease instead of VirtualInputManager
+local MAX_POINTS       = 20000
+----------------------------------------------------------------
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local UserInput    = game:GetService("UserInputService")
+local HttpService  = game:GetService("HttpService")
+local VirtualInput = game:GetService("VirtualInputManager")
+local CoreGui      = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+local KC = Enum.KeyCode
+local VK = { [KC.W] = 0x57, [KC.A] = 0x41, [KC.S] = 0x53, [KC.D] = 0x44, [KC.F] = 0x46, [KC.LeftShift] = 0x10 }
+
+-- Key output (only sends on state change)
+local held = {}
+local function setKey(code, down)
+    if (held[code] or false) == down then return end
+    held[code] = down
+    if USE_KEYPRESS and keypress and keyrelease then
+        pcall(down and keypress or keyrelease, VK[code])
+    else
+        pcall(function() VirtualInput:SendKeyEvent(down, code, false, game) end)
+    end
+end
+local function releaseAll()
+    for _, k in ipairs({ KC.W, KC.A, KC.S, KC.D }) do setKey(k, false) end
+end
+local function tapKey(code)
+    setKey(code, true)
+    task.wait(0.1)
+    setKey(code, false)
+end
+
+LocalPlayer.CharacterAdded:Connect(function() held[KC.LeftShift] = nil end)
+
+local function getHumanoid()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+local function getRoot()
+    local char = LocalPlayer.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+local function getVehiclePart()
+    local hum = getHumanoid()
+    local seat = hum and hum.SeatPart
+    if seat then return seat.AssemblyRootPart or seat end
+    local views = workspace:WaitForChild("VehicleViews")
+    local m = views and views:FindFirstChildOfClass("Model")
+    return m and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true))
+end
+
+local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+local function pt(list, i)
+    local p = list[i]
+    return Vector3.new(p.x, p.y, p.z)
+end
+
+----------------------------------------------------------------
+-- Path parsing (files are treated as data only: JSON-decoded and validated, never executed)
+----------------------------------------------------------------
+local function clean(list)
+    local out = {}
+    if type(list) ~= "table" then return out end
+    for i, p in ipairs(list) do
+        if i > MAX_POINTS then break end
+        if type(p) == "table" and tonumber(p.x) and tonumber(p.y) and tonumber(p.z) then
+            out[#out + 1] = {
+                x = tonumber(p.x), y = tonumber(p.y), z = tonumber(p.z),
+                s = math.clamp(tonumber(p.s) or 0, 0, 500),
+            }
+        end
+    end
+    return out
+end
+
+-- distance (flat) from point p to segment a-b
+local function distToSegment(p, a, b)
+    local abx, abz = b.x - a.x, b.z - a.z
+    local len2 = abx * abx + abz * abz
+    if len2 == 0 then return math.sqrt((p.x - a.x) ^ 2 + (p.z - a.z) ^ 2) end
+    local t = math.clamp(((p.x - a.x) * abx + (p.z - a.z) * abz) / len2, 0, 1)
+    return math.sqrt((p.x - (a.x + t * abx)) ^ 2 + (p.z - (a.z + t * abz)) ^ 2)
+end
+
+-- Ramer-Douglas-Peucker: turns a wobbly recorded walk into straight lines
+local function simplify(list, eps)
+    local n = #list
+    if n <= 2 then return list end
+    local keep = { [1] = true, [n] = true }
+    local stack = { { 1, n } }
+    while #stack > 0 do
+        local seg = table.remove(stack)
+        local i1, i2 = seg[1], seg[2]
+        local a, b = list[i1], list[i2]
+        local maxD, maxI = 0, nil
+        for i = i1 + 1, i2 - 1 do
+            local d = distToSegment(list[i], a, b)
+            if d > maxD then maxD, maxI = d, i end
+        end
+        if maxI and maxD > eps then
+            keep[maxI] = true
+            stack[#stack + 1] = { i1, maxI }
+            stack[#stack + 1] = { maxI, i2 }
+        end
+    end
+    local out = {}
+    for i = 1, n do
+        if keep[i] then out[#out + 1] = list[i] end
+    end
+    return out
+end
+
+local function parsePath(text)
+    text = text:gsub("^\239\187\191", "") -- strip UTF-8 BOM if present
+    local ok, data = pcall(HttpService.JSONDecode, HttpService, text)
+    if not ok or type(data) ~= "table" then return nil end
+    local drive = clean(data.drive or data.points) -- "points" = old recorder format
+    if #drive < 2 then return nil end
+    local walk = simplify(clean(data.walk), WALK_SIMPLIFY)
+
+    local cum = { 0 } -- cumulative path length, used to avoid exiting early on looping routes
+    for i = 2, #drive do
+        cum[i] = cum[i - 1] + (flat(pt(drive, i)) - flat(pt(drive, i - 1))).Magnitude
+    end
+    return {
+        drive = drive, walk = walk, cum = cum,
+        exits = ALWAYS_EXIT_AT_END or data.exited == true or #walk > 0,
+    }
+end
+
+----------------------------------------------------------------
+-- Repo loading: fetches BASE_URL/1.txt, 2.txt, ... directly
+----------------------------------------------------------------
+local httpRequest = (syn and syn.request) or (http and http.request)
+    or http_request or request or (fluxus and fluxus.request)
+
+local lastHttpStatus = "no http function"
+local function httpGet(url)
+    if httpRequest then
+        local ok, res = pcall(httpRequest, { Url = url, Method = "GET" })
+        if ok and res then
+            lastHttpStatus = "HTTP " .. tostring(res.StatusCode)
+            if res.StatusCode == 200 then return res.Body end
+            return nil
+        end
+    end
+    local ok, body = pcall(game.HttpGet, game, url)
+    if ok and type(body) == "string" then
+        lastHttpStatus = "HTTP 200"
+        return body
+    end
+    return nil
+end
+
+local repoPaths = {}   -- [n] = parsed path
+local nextProbe = 1    -- next number to look for (so new files are found on later starts)
+
+local function refreshRepo()
+    local misses, n = 0, nextProbe
+    while misses < MISS_LIMIT and n <= MAX_FILES do
+        local body = httpGet(BASE_URL .. "/" .. n .. FILE_EXT)
+        local p = body and parsePath(body)
+        if p then
+            repoPaths[n] = p
+            nextProbe = n + 1
+            misses = 0
+        else
+            misses += 1
+        end
+        n += 1
+    end
+end
+
+local function loadRandomPath()
+    refreshRepo()
+    local keys = {}
+    for k in pairs(repoPaths) do keys[#keys + 1] = k end
+    if #keys > 0 then
+        local k = keys[math.random(#keys)]
+        return repoPaths[k], k .. FILE_EXT
+    end
+
+    if ALLOW_LOCAL_FALLBACK then
+        local ok, text = pcall(readfile, LOCAL_FALLBACK)
+        local p = ok and parsePath(text)
+        if p then return p, LOCAL_FALLBACK end
+    end
+    return nil, nil, ("Repo failed (%s). Check BASE_URL"):format(lastHttpStatus)
+end
+
+----------------------------------------------------------------
+-- UI + state
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "DrivePlayer"
+gui.ResetOnSpawn = false
+gui.Parent = (gethui and gethui()) or CoreGui
+local label = Instance.new("TextLabel")
+label.Size = UDim2.fromOffset(340, 26)
+label.Position = UDim2.new(0, 20, 0, 92)
+label.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
+label.TextColor3 = Color3.new(1, 1, 1)
+label.Font = Enum.Font.Gotham
+label.TextSize = 13
+label.Text = "Player idle (F8 to start)"
+label.Parent = gui
+Instance.new("UICorner", label).CornerRadius = UDim.new(0, 6)
+
+-- phases: idle, loading, drive, exiting, walk
+local phase = "idle"
+local path, pathName
+local idx, widx = 1, 1
+local stuckT = 0
+local walkTarget, lastMoveTo = nil, 0
+
+local function stop(msg)
+    phase = "idle"
+    releaseAll()
+    local hum, root = getHumanoid(), getRoot()
+    if hum and root then pcall(function() hum:MoveTo(root.Position) end) end
+    label.Text = msg or "Stopped"
+end
+
+local function exitCar()
+    phase = "exiting"
+    task.spawn(function()
+        -- brake to a stop (max 3s)
+        local t0 = os.clock()
+        while phase == "exiting" and os.clock() - t0 < 3 do
+            local part = getVehiclePart()
+            local sp = part and flat(part.AssemblyLinearVelocity).Magnitude or 0
+            if sp < 2 then break end
+            setKey(KC.W, false); setKey(KC.A, false); setKey(KC.D, false)
+            setKey(KC.S, true)
+            label.Text = "Braking..."
+            task.wait(0.05)
+        end
+        releaseAll()
+
+        -- press F to leave the car (retry if still seated)
+        for _ = 1, 3 do
+            if phase ~= "exiting" then return end
+            label.Text = "Pressing F to exit..."
+            tapKey(EXIT_KEY)
+            task.wait(1.5)
+            local hum = getHumanoid()
+            if not (hum and hum.SeatPart) then break end
+        end
+        if phase ~= "exiting" then return end
+
+        if #path.walk == 0 then return stop("Finished (no walk path)") end
+        widx, stuckT, walkTarget = 1, 0, nil
+        phase = "walk"
+    end)
+end
+
+local function start()
+    if phase ~= "idle" then return end
+    phase = "loading"
+    label.Text = "Loading paths from repo..."
+    local p, name, err = loadRandomPath()
+    if phase ~= "loading" then return end -- cancelled while loading
+    if not p then return stop(err or "No path found") end
+    if not getVehiclePart() then return stop("No vehicle found") end
+
+    path, pathName = p, name
+    -- start at the waypoint closest to the car
+    local pos = getVehiclePart().Position
+    local best, bestD = 1, math.huge
+    for i = 1, #path.drive do
+        local d = (flat(pt(path.drive, i)) - flat(pos)).Magnitude
+        if d < bestD then best, bestD = i, d end
+    end
+    idx = best
+    phase = "drive"
+end
+
+-- Pulse a key pair to approximate analog input: v in [-1, 1]
+local function drivePWM(v, posKey, negKey)
+    local phasePos = (os.clock() % PWM_PERIOD) / PWM_PERIOD
+    local on = math.abs(v) > phasePos
+    setKey(posKey, v > 0 and on)
+    setKey(negKey, v < 0 and on)
+end
+
+local function driveStep()
+    local pts = path.drive
+    local part = getVehiclePart()
+    if not part then return stop("Lost vehicle") end
+
+    local pos = part.Position
+    local vel = flat(part.AssemblyLinearVelocity)
+    local speed = vel.Magnitude
+    local forward = speed > 3 and vel.Unit or flat(part.CFrame.LookVector).Unit
+
+    local lookahead = LOOKAHEAD_MIN + speed * LOOKAHEAD_SPEED
+    while idx < #pts and (flat(pt(pts, idx)) - flat(pos)).Magnitude < lookahead do
+        idx += 1
+    end
+
+    -- within EXIT_RADIUS of the last drive waypoint (and near the end of the route): leave the car
+    local distLast = (flat(pt(pts, #pts)) - flat(pos)).Magnitude
+    if distLast < EXIT_RADIUS and (path.cum[#pts] - path.cum[idx]) < EXIT_RADIUS * 3 then
+        releaseAll()
+        if path.exits then return exitCar() end
+        return stop("Finished")
+    end
+
+    local dir = flat(pt(pts, idx) - pos)
+    if dir.Magnitude < 0.1 then return end
+    dir = dir.Unit
+
+    local angle = math.atan2(forward:Cross(dir).Y, forward:Dot(dir)) -- positive = target on the left
+    local steer = 0
+    if math.abs(angle) > STEER_DEADZONE then
+        steer = math.clamp(angle / STEER_FULL_ANGLE, -1, 1)
+    end
+    drivePWM(steer, KC.A, KC.D) -- left = A, right = D
+
+    local targetSpeed = pts[idx].s * SPEED_SCALE
+    local throttle = math.clamp((targetSpeed - speed) / SPEED_RANGE, -1, 1)
+    if throttle < 0 and speed < 3 then throttle = 0 end -- don't reverse
+    drivePWM(throttle, KC.W, KC.S)
+
+    label.Text = ("DRIVE %d/%d | %.0f/%.0f studs/s | %.0f to end | %s"):format(
+        idx, #pts, speed, targetSpeed, distLast, tostring(pathName))
+end
+
+local function walkStep(dt)
+    local hum, root = getHumanoid(), getRoot()
+    if not hum or not root or hum.SeatPart then return end
+
+    local walkPts = path.walk
+    local pos = root.Position
+
+    -- skip waypoints already reached (the final one uses a tighter radius)
+    while widx <= #walkPts do
+        local reach = (widx == #walkPts) and 2.5 or WALK_REACH
+        if (flat(pt(walkPts, widx)) - flat(pos)).Magnitude < reach then
+            widx += 1
+            walkTarget = nil
+        else
+            break
+        end
+    end
+    if widx > #walkPts then
+    task.delay(math.random(24,42), function()
+    local args = {
+	buffer.fromstring("5\014\000Garage_Default"),
+	{}
+}
+game:GetService("ReplicatedStorage"):WaitForChild("AppNet"):WaitForChild("APP_RELIABLE"):FireServer(unpack(args))
+
+    end)
+     return stop("Arrived at destination")
+      end
+
+    -- only re-issue MoveTo when the target changes (or every second), so movement stays smooth
+    local target = pt(walkPts, widx)
+    if target ~= walkTarget or os.clock() - lastMoveTo > 1 then
+        hum:MoveTo(target)
+        if target ~= walkTarget then stuckT = 0 end
+        walkTarget, lastMoveTo = target, os.clock()
+    end
+
+    -- jump if blocked
+    if flat(root.AssemblyLinearVelocity).Magnitude < 1 then
+        stuckT += dt
+        if stuckT > 1.5 then hum.Jump = true stuckT = 0 end
+    else
+        stuckT = 0
+    end
+    label.Text = ("WALK %d/%d | %s"):format(widx, #walkPts, tostring(pathName))
+end
+
+local function wantSprint()
+    if not ALWAYS_SPRINT_OUT_OF_CAR then return false end
+    if phase == "drive" or phase == "exiting" then return false end
+    local hum = getHumanoid()
+    return hum ~= nil and hum.SeatPart == nil
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    setKey(KC.LeftShift, wantSprint()) -- hold SHIFT whenever you're out of the car
+
+    if phase == "drive" then
+        driveStep()
+    elseif phase == "walk" then
+        walkStep(dt)
+    end
+end)
+
+start()
