@@ -28,7 +28,6 @@ end
 SpawnAsCar()
 
 task.wait(math.random(2,6))
-
 -- Drive Player v3
 --   F8 start/stop. On start it loads a random numbered path file (1.txt, 2.txt, ...) from the repo,
 --   drives it with W/A/S/D at the recorded speeds, leaves the car (presses F) once it is within
@@ -44,6 +43,8 @@ env.__DrivePlayLoaded = true
 ----------------------------------------------------------------
 local TOGGLE_KEY = Enum.KeyCode.F8
 local EXIT_KEY   = Enum.KeyCode.F
+local AUTO_START = true               -- start driving the moment the script runs
+local AUTO_START_REQUIRE_SEAT = true  -- wait until you are seated in a car (set false if your car has no seat)
 
 -- Repo folder containing 1.txt, 2.txt, ... (no trailing slash)
 local BASE_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/BID_DRIVE_PATHS"
@@ -321,21 +322,38 @@ end
 local function exitCar()
     phase = "exiting"
     task.spawn(function()
-        -- brake to a stop (max 3s)
-        local t0 = os.clock()
-        while phase == "exiting" and os.clock() - t0 < 3 do
-            local part = getVehiclePart()
-            local sp = part and flat(part.AssemblyLinearVelocity).Magnitude or 0
-            if sp < 2 then break end
-            setKey(KC.W, false); setKey(KC.A, false); setKey(KC.D, false)
-            setKey(KC.S, true)
-            label.Text = "Braking..."
-            task.wait(0.05)
-        end
-        releaseAll()
+        -- Direction of travel when braking starts. S is only held while the car still moves along
+        -- it, so braking can never turn into reversing.
+        local part0 = getVehiclePart()
+        local v0 = part0 and flat(part0.AssemblyLinearVelocity) or Vector3.zero
+        local dir0 = v0.Magnitude > 1 and v0.Unit or nil
 
-        -- press F to leave the car (retry if still seated)
+        local function brake()
+            local t0 = os.clock()
+            while phase == "exiting" and os.clock() - t0 < 4 do
+                local part = getVehiclePart()
+                local v = part and flat(part.AssemblyLinearVelocity) or Vector3.zero
+                local along = dir0 and v:Dot(dir0) or 0
+                if along < 2 then break end
+                setKey(KC.W, false); setKey(KC.A, false); setKey(KC.D, false)
+                setKey(KC.S, true)
+                label.Text = "Braking..."
+                task.wait(0.03)
+            end
+            releaseAll()
+            -- let any remaining roll settle before pressing F
+            local t1 = os.clock()
+            while phase == "exiting" and os.clock() - t1 < 1.5 do
+                local part = getVehiclePart()
+                if not part or flat(part.AssemblyLinearVelocity).Magnitude < 1.5 then break end
+                task.wait(0.05)
+            end
+        end
+
+        -- press F to leave the car (re-stop and retry if still seated)
         for _ = 1, 3 do
+            if phase ~= "exiting" then return end
+            brake()
             if phase ~= "exiting" then return end
             label.Text = "Pressing F to exit..."
             tapKey(EXIT_KEY)
@@ -351,18 +369,21 @@ local function exitCar()
     end)
 end
 
+local userStopped = false
+
 local function start()
-    if phase ~= "idle" then return end
+    if phase ~= "idle" then return false end
     phase = "loading"
     label.Text = "Loading paths from repo..."
     local p, name, err = loadRandomPath()
-    if phase ~= "loading" then return end -- cancelled while loading
-    if not p then return stop(err or "No path found") end
-    if not getVehiclePart() then return stop("No vehicle found") end
+    if phase ~= "loading" then return false end -- cancelled while loading
+    if not p then stop(err or "No path found") return false end
+    local part = getVehiclePart()
+    if not part then stop("No vehicle found") return false end
 
     path, pathName = p, name
     -- start at the waypoint closest to the car
-    local pos = getVehiclePart().Position
+    local pos = part.Position
     local best, bestD = 1, math.huge
     for i = 1, #path.drive do
         local d = (flat(pt(path.drive, i)) - flat(pos)).Magnitude
@@ -371,11 +392,18 @@ local function start()
     idx = best
     stallT = 0
     phase = "drive"
+    return true
 end
 
 UserInput.InputBegan:Connect(function(input, _)
     if input.KeyCode ~= TOGGLE_KEY or UserInput:GetFocusedTextBox() then return end
-    if phase == "idle" then start() else stop("Stopped") end
+    if phase == "idle" then
+        userStopped = false
+        start()
+    else
+        userStopped = true
+        stop("Stopped")
+    end
 end)
 
 -- Pulse a key pair to approximate analog input: v in [-1, 1]
@@ -492,3 +520,21 @@ RunService.Heartbeat:Connect(function(dt)
         walkStep(dt)
     end
 end)
+
+-- Auto-start: begin as soon as the script runs (waits until you are in a car if needed).
+if AUTO_START then
+    task.spawn(function()
+        if not game:IsLoaded() then game.Loaded:Wait() end
+        while not getRoot() do task.wait(0.5) end
+        while not userStopped and phase == "idle" do
+            local hum = getHumanoid()
+            local seated = hum ~= nil and hum.SeatPart ~= nil
+            if seated or not AUTO_START_REQUIRE_SEAT then
+                if start() then return end
+            else
+                label.Text = "Waiting to be seated in a car..."
+            end
+            task.wait(2)
+        end
+    end)
+end
