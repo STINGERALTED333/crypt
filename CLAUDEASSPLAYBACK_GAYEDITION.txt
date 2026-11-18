@@ -13,14 +13,18 @@ end
 
 local function SpawnAsCar()
     repeat task.wait(1) until game.Players.LocalPlayer.Character
-local args = {
-	buffer.fromstring("+\v\000Vehicle_622"),
-	{}
-}
-game:GetService("ReplicatedStorage"):WaitForChild("AppNet"):WaitForChild("APP_RELIABLE"):FireServer(unpack(args))
 
+    local Car = workspace.VehicleViews:FindFirstChildOfClass("Model")
+    local ID = Car and Car:GetAttribute("GarageVehicleId")
+    if ID then
+        APP_RELIABLE:FireServer(encodeDrive(ID), {})  -- {} = instance list, empty here
+        return true
+    end
+
+    warn("[ERROR]: No car found in garage!")
     return nil
 end
+
 
 SpawnAsCar()
 task.wait(1)
