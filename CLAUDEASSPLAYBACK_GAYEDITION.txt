@@ -26,8 +26,7 @@ local function SpawnAsCar()
 end
 
 SpawnAsCar()
-
-task.wait(math.random(2,6))
+task.wait(1)
 -- Drive Player v3
 --   F8 start/stop. On start it loads a random numbered path file (1.txt, 2.txt, ...) from the repo,
 --   drives it with W/A/S/D at the recorded speeds, leaves the car (presses F) once it is within
@@ -47,7 +46,7 @@ local AUTO_START = true               -- start driving the moment the script run
 local AUTO_START_REQUIRE_IN_CAR = false -- true = wait until isInCar() says you are in a car (needs seat/weld detection to work)
 
 -- Repo folder containing 1.txt, 2.txt, ... (no trailing slash)
-local BASE_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/BID_DRIVE_PATHS"
+local BASE_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/HOST_DRIVE_PATHS"
 local FILE_EXT = ".txt"
 local MISS_LIMIT = 2            -- stop probing after this many missing numbers in a row
 local MAX_FILES  = 200
