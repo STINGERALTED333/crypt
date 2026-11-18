@@ -28,6 +28,7 @@ end
 SpawnAsCar()
 
 task.wait(math.random(2,6))
+
 -- Drive Player v3
 --   F8 start/stop. On start it loads a random numbered path file (1.txt, 2.txt, ...) from the repo,
 --   drives it with W/A/S/D at the recorded speeds, leaves the car (presses F) once it is within
@@ -64,11 +65,14 @@ local STEER_FULL_ANGLE = math.rad(35)
 local STEER_DEADZONE   = math.rad(2)
 local SPEED_RANGE      = 8
 local PWM_PERIOD       = 0.15
+local KEY_REFRESH      = 0.2    -- seconds between re-sending keydown for held drive keys
+local STALL_SPEED      = 2      -- studs/s; below this counts as stopped
+local STALL_TIME       = 1.5    -- seconds stopped before throttle is forced to full
 -- Walking
 local WALK_SIMPLIFY    = 3      -- studs; recorded walk is straightened into lines (bigger = straighter)
 local WALK_REACH       = 3      -- studs; waypoint counts as reached
 local USE_KEYPRESS     = false  -- true = executor keypress/keyrelease instead of VirtualInputManager
-local MAX_POINTS       = 20000
+local MAX_POINTS       = 40000
 ----------------------------------------------------------------
 
 local Players      = game:GetService("Players")
@@ -83,14 +87,34 @@ local KC = Enum.KeyCode
 local VK = { [KC.W] = 0x57, [KC.A] = 0x41, [KC.S] = 0x53, [KC.D] = 0x44, [KC.F] = 0x46, [KC.LeftShift] = 0x10 }
 
 -- Key output (only sends on state change)
-local held = {}
-local function setKey(code, down)
-    if (held[code] or false) == down then return end
-    held[code] = down
+local held, sentAt = {}, {}
+local function sendKey(code, down)
+    sentAt[code] = os.clock()
     if USE_KEYPRESS and keypress and keyrelease then
         pcall(down and keypress or keyrelease, VK[code])
     else
         pcall(function() VirtualInput:SendKeyEvent(down, code, false, game) end)
+    end
+end
+local function setKey(code, down)
+    if (held[code] or false) == down then return end
+    held[code] = down
+    sendKey(code, down)
+end
+
+-- The game can drop key state (window focus change, you pressing keys yourself), which would
+-- leave us "holding" a key that is really up. So drive keys are re-sent periodically:
+-- keydown every KEY_REFRESH seconds for keys we hold, keyup every second for keys we don't.
+local DRIVE_KEYS = { KC.W, KC.A, KC.S, KC.D }
+local function refreshKeys()
+    local now = os.clock()
+    for _, k in ipairs(DRIVE_KEYS) do
+        local age = now - (sentAt[k] or 0)
+        if held[k] then
+            if age > KEY_REFRESH then sendKey(k, true) end
+        elseif age > 1 then
+            sendKey(k, false)
+        end
     end
 end
 local function releaseAll()
@@ -116,7 +140,7 @@ local function getVehiclePart()
     local hum = getHumanoid()
     local seat = hum and hum.SeatPart
     if seat then return seat.AssemblyRootPart or seat end
-    local views = workspace:WaitForChild("VehicleViews")
+    local views = workspace:FindFirstChild("VehicleViews")
     local m = views and views:FindFirstChildOfClass("Model")
     return m and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true))
 end
@@ -283,6 +307,7 @@ local phase = "idle"
 local path, pathName
 local idx, widx = 1, 1
 local stuckT = 0
+local stallT = 0
 local walkTarget, lastMoveTo = nil, 0
 
 local function stop(msg)
@@ -344,8 +369,14 @@ local function start()
         if d < bestD then best, bestD = i, d end
     end
     idx = best
+    stallT = 0
     phase = "drive"
 end
+
+UserInput.InputBegan:Connect(function(input, _)
+    if input.KeyCode ~= TOGGLE_KEY or UserInput:GetFocusedTextBox() then return end
+    if phase == "idle" then start() else stop("Stopped") end
+end)
 
 -- Pulse a key pair to approximate analog input: v in [-1, 1]
 local function drivePWM(v, posKey, negKey)
@@ -355,7 +386,7 @@ local function drivePWM(v, posKey, negKey)
     setKey(negKey, v < 0 and on)
 end
 
-local function driveStep()
+local function driveStep(dt)
     local pts = path.drive
     local part = getVehiclePart()
     if not part then return stop("Lost vehicle") end
@@ -392,10 +423,17 @@ local function driveStep()
     local targetSpeed = pts[idx].s * SPEED_SCALE
     local throttle = math.clamp((targetSpeed - speed) / SPEED_RANGE, -1, 1)
     if throttle < 0 and speed < 3 then throttle = 0 end -- don't reverse
+
+    -- anti-stall: if the car has been (almost) stopped for a while, floor it until it moves
+    if speed < STALL_SPEED then stallT += dt else stallT = 0 end
+    if stallT > STALL_TIME then throttle = 1 end
+
     drivePWM(throttle, KC.W, KC.S)
 
-    label.Text = ("DRIVE %d/%d | %.0f/%.0f studs/s | %.0f to end | %s"):format(
-        idx, #pts, speed, targetSpeed, distLast, tostring(pathName))
+    local keys = (held[KC.W] and "W" or "-") .. (held[KC.A] and "A" or "-")
+        .. (held[KC.S] and "S" or "-") .. (held[KC.D] and "D" or "-")
+    label.Text = ("DRIVE %d/%d | %.0f/%.0f studs/s | %.0f to end | %s | %s"):format(
+        idx, #pts, speed, targetSpeed, distLast, keys, tostring(pathName))
 end
 
 local function walkStep(dt)
@@ -415,17 +453,7 @@ local function walkStep(dt)
             break
         end
     end
-    if widx > #walkPts then
-    task.delay(math.random(24,42), function()
-    local args = {
-	buffer.fromstring("5\014\000Garage_Default"),
-	{}
-}
-game:GetService("ReplicatedStorage"):WaitForChild("AppNet"):WaitForChild("APP_RELIABLE"):FireServer(unpack(args))
-
-    end)
-     return stop("Arrived at destination")
-      end
+    if widx > #walkPts then return stop("Arrived at destination") end
 
     -- only re-issue MoveTo when the target changes (or every second), so movement stays smooth
     local target = pt(walkPts, widx)
@@ -456,10 +484,11 @@ RunService.Heartbeat:Connect(function(dt)
     setKey(KC.LeftShift, wantSprint()) -- hold SHIFT whenever you're out of the car
 
     if phase == "drive" then
-        driveStep()
+        driveStep(dt)
+        refreshKeys()
+    elseif phase == "exiting" then
+        refreshKeys()
     elseif phase == "walk" then
         walkStep(dt)
     end
 end)
-
-start()
