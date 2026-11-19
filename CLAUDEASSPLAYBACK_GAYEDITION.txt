@@ -28,11 +28,16 @@ end
 
 SpawnAsCar()
 task.wait(1)
--- Drive Player v3
---   F8 start/stop. On start it loads a random numbered path file (1.txt, 2.txt, ...) from the repo,
---   drives it with W/A/S/D at the recorded speeds, leaves the car (presses F) once it is within
---   EXIT_RADIUS studs of the last drive waypoint, then walks (sprinting) in straight lines to the destination.
---   While you are out of the car, LeftShift is held (sprint).
+
+-- Drive Player v6 — WAIT FOR PAWNS mode
+--
+--   F8  start/stop. Same as v5 but every 0-speed waypoint means
+--   "wait until all seats in the car are occupied (or MAX_PAWN_WAIT
+--   seconds pass)". Everything else identical to v5.
+--
+--   Recorded waits are irrelevant in this mode — only the *position*
+--   of stop waypoints matters. Set WAIT_UNTIL_CAR_FULL = false to
+--   fall back to fixed-duration waits.
 
 local env = (getgenv and getgenv()) or _G
 if env.__DrivePlayLoaded then return end
@@ -43,38 +48,54 @@ env.__DrivePlayLoaded = true
 ----------------------------------------------------------------
 local TOGGLE_KEY = Enum.KeyCode.F8
 local EXIT_KEY   = Enum.KeyCode.F
-local AUTO_START = true               -- start driving the moment the script runs
-local AUTO_START_REQUIRE_IN_CAR = false -- true = wait until isInCar() says you are in a car (needs seat/weld detection to work)
+local AUTO_START = true
+local AUTO_START_REQUIRE_IN_CAR = false
 
--- Repo folder containing 1.txt, 2.txt, ... (no trailing slash)
 local BASE_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/HOST_DRIVE_PATHS"
 local FILE_EXT = ".txt"
-local MISS_LIMIT = 2            -- stop probing after this many missing numbers in a row
+local MISS_LIMIT = 2
 local MAX_FILES  = 200
-local ALLOW_LOCAL_FALLBACK = false   -- true = use drive_path.json if the repo fails
+local ALLOW_LOCAL_FALLBACK = false
 local LOCAL_FALLBACK = "drive_path.json"
 
 local ALWAYS_SPRINT_OUT_OF_CAR = true
-local EXIT_RADIUS      = 20     -- studs from the last drive waypoint at which it brakes and leaves the car
-local ALWAYS_EXIT_AT_END = true -- leave the car even if the recording has no walk part
+local EXIT_RADIUS              = 20
+local ALWAYS_EXIT_AT_END       = true
 
 -- Driving
-local SPEED_SCALE      = 1.0
-local LOOKAHEAD_MIN    = 8       -- studs ahead to aim at (short = follows corners closely)
-local LOOKAHEAD_SPEED  = 0.25    -- extra lookahead per stud/s
-local STEER_FULL_ANGLE = math.rad(10)  -- heading error that gives full steering lock (smaller = more decisive)
-local STEER_LEAD       = 2.0     -- seconds-ish of lead: releases steering early based on how fast the car is already turning
-local DRIVE_SMOOTH_STUDS = 5     -- recorded drive path is smoothed over about this many studs
-local SPEED_RANGE      = 8
-local PWM_PERIOD       = 0.12
-local KEY_REFRESH      = 0.1    -- seconds between re-sending keydown for held drive keys
-local STALL_SPEED      = 2      -- studs/s; below this counts as stopped
-local STALL_TIME       = 1.5    -- seconds stopped before throttle is forced to full
+local SPEED_SCALE       = 1.0
+local LOOKAHEAD_MIN     = 10
+local LOOKAHEAD_MAX     = 40
+local LOOKAHEAD_SPEED   = 0.30
+local STEER_FULL_ANGLE  = math.rad(22)
+local STEER_LEAD        = 0.35
+local STEER_SMOOTH      = 0.6
+local STEER_DEADBAND    = 0.02
+local SPEED_RANGE       = 10
+local PWM_PERIOD        = 0.12
+local KEY_REFRESH       = 0.1
+
+-- Stall / recovery
+local STALL_SPEED         = 2
+local STALL_TIME          = 1.5
+local REVERSE_TIME        = 1.0
+local FORWARD_TIME        = 2.0
+local MAX_RECOVERY_CYCLES = 3
+local SKIP_AHEAD          = 3
+
+-- Wait behavior
+local WAIT_UNTIL_CAR_FULL = true      -- ← v6: wait for ALL seats occupied
+local MAX_PAWN_WAIT       = 90        -- give up waiting after this many seconds
+local WAIT_PER_WAYPOINT   = 0.5       -- used only when WAIT_UNTIL_CAR_FULL = false
+local WAIT_TRIGGER_SPEED  = 0.5
+local WAIT_TRIGGER_RADIUS = 6.0
+local BRAKE_RANGE         = 25
+
 -- Walking
-local WALK_SIMPLIFY    = 3      -- studs; recorded walk is straightened into lines (bigger = straighter)
-local WALK_REACH       = 3      -- studs; waypoint counts as reached
-local USE_KEYPRESS     = false  -- true = executor keypress/keyrelease instead of VirtualInputManager
-local MAX_POINTS       = 40000
+local WALK_SIMPLIFY = 3
+local WALK_REACH    = 3
+local USE_KEYPRESS  = false
+local MAX_POINTS    = 40000
 ----------------------------------------------------------------
 
 local Players      = game:GetService("Players")
@@ -86,9 +107,10 @@ local CoreGui      = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local KC = Enum.KeyCode
-local VK = { [KC.W] = 0x57, [KC.A] = 0x41, [KC.S] = 0x53, [KC.D] = 0x44, [KC.F] = 0x46, [KC.LeftShift] = 0x10 }
+local VK = { [KC.W] = 0x57, [KC.A] = 0x41, [KC.S] = 0x53, [KC.D] = 0x44,
+             [KC.F] = 0x46, [KC.LeftShift] = 0x10 }
 
--- Key output (only sends on state change)
+-- Key output
 local held, sentAt = {}, {}
 local function sendKey(code, down)
     sentAt[code] = os.clock()
@@ -104,9 +126,6 @@ local function setKey(code, down)
     sendKey(code, down)
 end
 
--- The game can drop key state (window focus change, you pressing keys yourself), which would
--- leave us "holding" a key that is really up. So drive keys are re-sent periodically:
--- keydown every KEY_REFRESH seconds for keys we hold, keyup every second for keys we don't.
 local DRIVE_KEYS = { KC.W, KC.A, KC.S, KC.D }
 local function refreshKeys()
     local now = os.clock()
@@ -146,9 +165,6 @@ local function getVehiclePart()
     local m = views and views:FindFirstChildOfClass("Model")
     return m and (m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart", true))
 end
-
--- Are we in a car? Works for seat-based and seatless cars:
--- seated, or the character is welded to / parented inside something that is not the character.
 local function isInCar()
     local hum, root = getHumanoid(), getRoot()
     if not hum or not root then return false end
@@ -160,15 +176,45 @@ local function isInCar()
     return false
 end
 
+-- Find the ancestor Model that has OwnerUserId AND a Seats folder
+local function findCarModel(part)
+    if not part then return nil end
+    local m = part
+    while m do
+        if m:IsA("Model") and m:GetAttribute("OwnerUserId") and m:FindFirstChild("Seats") then
+            return m
+        end
+        m = m.Parent
+    end
+    return nil
+end
+
+-- Returns total, occupied. total == 0 means "couldn't detect" → caller should skip.
+local function countSeats(part)
+    local model = findCarModel(part)
+    if not model then return 0, 0 end
+    local seats = model:FindFirstChild("Seats")
+    if not seats then return 0, 0 end
+    local total, occupied = 0, 0
+    for _, seat in ipairs(seats:GetChildren()) do
+        if seat:IsA("Seat") or seat:IsA("VehicleSeat") then
+            total = total + 1
+            if seat.Occupant then occupied = occupied + 1 end
+        end
+    end
+    return total, occupied
+end
+
 local function flat(v) return Vector3.new(v.X, 0, v.Z) end
 local function pt(list, i)
     local p = list[i]
     return Vector3.new(p.x, p.y, p.z)
 end
+local function unitOr(v, fallback)
+    return v.Magnitude > 0.01 and v.Unit or fallback
+end
 
-----------------------------------------------------------------
--- Path parsing (files are treated as data only: JSON-decoded and validated, never executed)
-----------------------------------------------------------------
+-- Path parsing
 local function clean(list)
     local out = {}
     if type(list) ~= "table" then return out end
@@ -184,7 +230,6 @@ local function clean(list)
     return out
 end
 
--- distance (flat) from point p to segment a-b
 local function distToSegment(p, a, b)
     local abx, abz = b.x - a.x, b.z - a.z
     local len2 = abx * abx + abz * abz
@@ -193,7 +238,6 @@ local function distToSegment(p, a, b)
     return math.sqrt((p.x - (a.x + t * abx)) ^ 2 + (p.z - (a.z + t * abz)) ^ 2)
 end
 
--- Ramer-Douglas-Peucker: turns a wobbly recorded walk into straight lines
 local function simplify(list, eps)
     local n = #list
     if n <= 2 then return list end
@@ -221,8 +265,7 @@ local function simplify(list, eps)
     return out
 end
 
--- Moving-average smoothing of the recorded drive path (removes the wiggles from your own
--- manual steering, so the target direction doesn't jump around). Endpoints are kept exact.
+-- Smooth motion but never average across stop waypoints (they're wait markers)
 local function smoothDrive(list)
     local n = #list
     if n < 5 then return list end
@@ -230,35 +273,38 @@ local function smoothDrive(list)
     for i = 2, n do
         len += (Vector3.new(list[i].x - list[i - 1].x, 0, list[i].z - list[i - 1].z)).Magnitude
     end
-    local spacing = len / (n - 1)
-    local radius = math.floor(DRIVE_SMOOTH_STUDS / math.max(spacing, 0.1) + 0.5)
+    local spacing = len / math.max(n - 1, 1)
+    local radius = math.floor(5 / math.max(spacing, 0.1) + 0.5)
     if radius < 1 then return list end
-
     local out = {}
     for i = 1, n do
-        if i == 1 or i == n then
-            out[i] = list[i]
+        local p = list[i]
+        local isStop = (p.s or 0) < WAIT_TRIGGER_SPEED
+        if i == 1 or i == n or isStop then
+            out[i] = p
         else
             local sx, sy, sz, ss, c = 0, 0, 0, 0, 0
+            local sawStop = false
             for j = math.max(1, i - radius), math.min(n, i + radius) do
-                local p = list[j]
-                sx += p.x; sy += p.y; sz += p.z; ss += p.s; c += 1
+                local q = list[j]
+                if (q.s or 0) < WAIT_TRIGGER_SPEED then sawStop = true; break end
+                sx += q.x; sy += q.y; sz += q.z; ss += q.s; c += 1
             end
-            out[i] = { x = sx / c, y = sy / c, z = sz / c, s = ss / c }
+            if sawStop or c == 0 then out[i] = p
+            else out[i] = { x = sx / c, y = sy / c, z = sz / c, s = ss / c } end
         end
     end
     return out
 end
 
 local function parsePath(text)
-    text = text:gsub("^\239\187\191", "") -- strip UTF-8 BOM if present
+    text = text:gsub("^\239\187\191", "")
     local ok, data = pcall(HttpService.JSONDecode, HttpService, text)
     if not ok or type(data) ~= "table" then return nil end
-    local drive = smoothDrive(clean(data.drive or data.points)) -- "points" = old recorder format
+    local drive = smoothDrive(clean(data.drive or data.points))
     if #drive < 2 then return nil end
     local walk = simplify(clean(data.walk), WALK_SIMPLIFY)
-
-    local cum = { 0 } -- cumulative path length, used to avoid exiting early on looping routes
+    local cum = { 0 }
     for i = 2, #drive do
         cum[i] = cum[i - 1] + (flat(pt(drive, i)) - flat(pt(drive, i - 1))).Magnitude
     end
@@ -268,12 +314,9 @@ local function parsePath(text)
     }
 end
 
-----------------------------------------------------------------
--- Repo loading: fetches BASE_URL/1.txt, 2.txt, ... directly
-----------------------------------------------------------------
+-- Repo loading
 local httpRequest = (syn and syn.request) or (http and http.request)
     or http_request or request or (fluxus and fluxus.request)
-
 local lastHttpStatus = "no http function"
 local function httpGet(url)
     if httpRequest then
@@ -285,32 +328,21 @@ local function httpGet(url)
         end
     end
     local ok, body = pcall(game.HttpGet, game, url)
-    if ok and type(body) == "string" then
-        lastHttpStatus = "HTTP 200"
-        return body
-    end
+    if ok and type(body) == "string" then lastHttpStatus = "HTTP 200"; return body end
     return nil
 end
-
-local repoPaths = {}   -- [n] = parsed path
-local nextProbe = 1    -- next number to look for (so new files are found on later starts)
-
+local repoPaths = {}
+local nextProbe = 1
 local function refreshRepo()
     local misses, n = 0, nextProbe
     while misses < MISS_LIMIT and n <= MAX_FILES do
         local body = httpGet(BASE_URL .. "/" .. n .. FILE_EXT)
         local p = body and parsePath(body)
-        if p then
-            repoPaths[n] = p
-            nextProbe = n + 1
-            misses = 0
-        else
-            misses += 1
-        end
+        if p then repoPaths[n] = p; nextProbe = n + 1; misses = 0
+        else misses += 1 end
         n += 1
     end
 end
-
 local function loadRandomPath()
     refreshRepo()
     local keys = {}
@@ -319,35 +351,32 @@ local function loadRandomPath()
         local k = keys[math.random(#keys)]
         return repoPaths[k], k .. FILE_EXT
     end
-
     if ALLOW_LOCAL_FALLBACK then
         local ok, text = pcall(readfile, LOCAL_FALLBACK)
         local p = ok and parsePath(text)
         if p then return p, LOCAL_FALLBACK end
     end
-    return nil, nil, ("Repo failed (%s). Check BASE_URL"):format(lastHttpStatus)
+    return nil, nil, ("Repo failed (%s)"):format(lastHttpStatus)
 end
 
-----------------------------------------------------------------
--- UI + state
-----------------------------------------------------------------
+-- UI
 local gui = Instance.new("ScreenGui")
 gui.Name = "DrivePlayer"
 gui.ResetOnSpawn = false
 gui.Parent = (gethui and gethui()) or CoreGui
 local label = Instance.new("TextLabel")
-label.Size = UDim2.fromOffset(470, 26)
+label.Size = UDim2.fromOffset(680, 26)
 label.Position = UDim2.new(0, 20, 0, 92)
 label.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
 label.TextColor3 = Color3.new(1, 1, 1)
 label.Font = Enum.Font.Gotham
 label.TextSize = 13
-label.Text = "Player idle (F8 to start)"
+label.Text = "Autopilot (pawns) idle (F8 to start)"
 label.Parent = gui
 Instance.new("UICorner", label).CornerRadius = UDim.new(0, 6)
 
 local dbg = Instance.new("TextLabel")
-dbg.Size = UDim2.fromOffset(470, 22)
+dbg.Size = UDim2.fromOffset(680, 22)
 dbg.Position = UDim2.new(0, 20, 0, 122)
 dbg.BackgroundColor3 = Color3.fromRGB(30, 30, 36)
 dbg.TextColor3 = Color3.fromRGB(180, 180, 190)
@@ -357,18 +386,24 @@ dbg.Text = ""
 dbg.Parent = gui
 Instance.new("UICorner", dbg).CornerRadius = UDim.new(0, 6)
 
--- phases: idle, loading, drive, exiting, walk
+-- State
 local phase = "idle"
+local driveState = "normal"
+local recovery = { phase = "none", timer = 0, cycle = 0, steerDir = 1 }
 local path, pathName
 local idx, widx = 1, 1
 local stuckT = 0
 local stallT = 0
-local prevHeading, prevSrc, yawRate = nil, nil, 0
+local waitT = 0
+local steerSmooth = 0
+local yawRate = 0
+local fwdLocal = nil
 local walkTarget, lastMoveTo = nil, 0
 
 local function stop(msg)
     dbg.Text = ""
     phase = "idle"
+    driveState = "normal"
     releaseAll()
     local hum, root = getHumanoid(), getRoot()
     if hum and root then pcall(function() hum:MoveTo(root.Position) end) end
@@ -378,12 +413,9 @@ end
 local function exitCar()
     phase = "exiting"
     task.spawn(function()
-        -- Direction of travel when braking starts. S is only held while the car still moves along
-        -- it, so braking can never turn into reversing.
         local part0 = getVehiclePart()
         local v0 = part0 and flat(part0.AssemblyLinearVelocity) or Vector3.zero
         local dir0 = v0.Magnitude > 1 and v0.Unit or nil
-
         local function brake()
             local t0 = os.clock()
             while phase == "exiting" and os.clock() - t0 < 4 do
@@ -397,7 +429,6 @@ local function exitCar()
                 task.wait(0.03)
             end
             releaseAll()
-            -- let any remaining roll settle before pressing F
             local t1 = os.clock()
             while phase == "exiting" and os.clock() - t1 < 1.5 do
                 local part = getVehiclePart()
@@ -405,8 +436,6 @@ local function exitCar()
                 task.wait(0.05)
             end
         end
-
-        -- press F to leave the car (re-stop and retry if still seated)
         for _ = 1, 3 do
             if phase ~= "exiting" then return end
             brake()
@@ -417,7 +446,6 @@ local function exitCar()
             if not isInCar() then break end
         end
         if phase ~= "exiting" then return end
-
         if #path.walk == 0 then return stop("Finished (no walk path)") end
         widx, stuckT, walkTarget = 1, 0, nil
         phase = "walk"
@@ -425,19 +453,17 @@ local function exitCar()
 end
 
 local userStopped = false
-
 local function start()
     if phase ~= "idle" then return false end
     phase = "loading"
-    label.Text = "Loading paths from repo..."
+    label.Text = "Loading paths..."
     local p, name, err = loadRandomPath()
-    if phase ~= "loading" then return false end -- cancelled while loading
+    if phase ~= "loading" then return false end
     if not p then stop(err or "No path found") return false end
     local part = getVehiclePart()
     if not part then stop("No vehicle found") return false end
 
     path, pathName = p, name
-    -- start at the waypoint closest to the car
     local pos = part.Position
     local best, bestD = 1, math.huge
     for i = 1, #path.drive do
@@ -445,24 +471,18 @@ local function start()
         if d < bestD then best, bestD = i, d end
     end
     idx = best
-    stallT = 0
-    prevHeading, prevSrc, yawRate = nil, nil, 0
+    stallT = 0; waitT = 0; steerSmooth = 0; yawRate = 0
+    driveState = "normal"; recovery.phase = "none"; recovery.timer = 0; recovery.cycle = 0
     phase = "drive"
     return true
 end
 
 UserInput.InputBegan:Connect(function(input, _)
     if input.KeyCode ~= TOGGLE_KEY or UserInput:GetFocusedTextBox() then return end
-    if phase == "idle" then
-        userStopped = false
-        start()
-    else
-        userStopped = true
-        stop("Stopped")
-    end
+    if phase == "idle" then userStopped = false; start()
+    else userStopped = true; stop("Stopped") end
 end)
 
--- Pulse a key pair to approximate analog input: v in [-1, 1]
 local function drivePWM(v, posKey, negKey)
     local phasePos = (os.clock() % PWM_PERIOD) / PWM_PERIOD
     local on = math.abs(v) > phasePos
@@ -470,12 +490,9 @@ local function drivePWM(v, posKey, negKey)
     setKey(negKey, v < 0 and on)
 end
 
-local fwdLocal = nil -- the car's forward axis in its own space; learned while driving forward
-
-local function unitOr(v, fallback)
-    return v.Magnitude > 0.01 and v.Unit or fallback
-end
-
+----------------------------------------------------------------
+-- Drive step
+----------------------------------------------------------------
 local function driveStep(dt)
     local pts = path.drive
     local part = getVehiclePart()
@@ -484,59 +501,153 @@ local function driveStep(dt)
     local pos = part.Position
     local vel = flat(part.AssemblyLinearVelocity)
     local speed = vel.Magnitude
+    local idxC = math.min(idx, #pts)
+    local curV = pts[idxC].s or 0
+    local distCur = (flat(pt(pts, idxC)) - flat(pos)).Magnitude
 
-    local lookahead = LOOKAHEAD_MIN + speed * LOOKAHEAD_SPEED
-    while idx < #pts and (flat(pt(pts, idx)) - flat(pos)).Magnitude < lookahead do
-        idx += 1
-    end
-
-    -- within EXIT_RADIUS of the last drive waypoint (and near the end of the route): leave the car
+    -- Exit
     local distLast = (flat(pt(pts, #pts)) - flat(pos)).Magnitude
-    if distLast < EXIT_RADIUS and (path.cum[#pts] - path.cum[idx]) < EXIT_RADIUS * 3 then
+    if distLast < EXIT_RADIUS and (path.cum[#pts] - path.cum[idxC]) < EXIT_RADIUS * 3 then
         releaseAll()
         if path.exits then return exitCar() end
         return stop("Finished")
     end
 
-    local dir = flat(pt(pts, idx) - pos)
-    if dir.Magnitude < 0.1 then return end
-    dir = dir.Unit
+    -- WAIT BLOCK -----------------------------------------------------
+    if curV < WAIT_TRIGGER_SPEED and distCur < WAIT_TRIGGER_RADIUS then
+        if speed > 1 then
+            drivePWM(-0.7, KC.W, KC.S)
+            label.Text = ("BRAKE @ wp %d | spd %.1f"):format(idx, speed)
+            return
+        end
 
-    -- SIGNED speed toward the route target. Negative = rolling backwards / away from it.
-    -- (Plain speed can't tell forward from reverse, which made the old code keep holding S
-    -- while the car reversed away.)
+        if WAIT_UNTIL_CAR_FULL then
+            local total, occupied = countSeats(part)
+            if total == 0 or occupied >= total then
+                -- Car full (or no seats detected): skip ALL consecutive stops
+                while idx <= #pts and (pts[idx].s or 0) < WAIT_TRIGGER_SPEED do
+                    idx = idx + 1
+                end
+                idxC = math.min(idx, #pts)
+                curV = pts[idxC].s or 0
+                distCur = (flat(pt(pts, idxC)) - flat(pos)).Magnitude
+                waitT = 0
+                -- fall through to driving
+            else
+                waitT = waitT + dt
+                releaseAll()
+                label.Text = ("WAIT PAWNS %d/%d @ wp %d | %.1fs"):format(
+                    occupied, total, idx, waitT)
+                dbg.Text = "waiting for pawns to fill all seats"
+                if waitT > MAX_PAWN_WAIT then
+                    while idx <= #pts and (pts[idx].s or 0) < WAIT_TRIGGER_SPEED do
+                        idx = idx + 1
+                    end
+                    idxC = math.min(idx, #pts)
+                    curV = pts[idxC].s or 0
+                    distCur = (flat(pt(pts, idxC)) - flat(pos)).Magnitude
+                    waitT = 0
+                    dbg.Text = "pawn wait TIMEOUT — proceeding"
+                    -- fall through
+                else
+                    return
+                end
+            end
+        else
+            waitT = waitT + dt
+            if waitT >= WAIT_PER_WAYPOINT then
+                waitT = 0
+                idx = idx + 1
+            end
+            releaseAll()
+            label.Text = ("WAIT %.1fs @ wp %d"):format(waitT, idx)
+            return
+        end
+    end
+    waitT = 0
+
+    -- Advance idx (distance-based, stops break the walk)
+    local lookahead = math.min(LOOKAHEAD_MIN + speed * LOOKAHEAD_SPEED, LOOKAHEAD_MAX)
+    while idx < #pts do
+        local s = pts[idx].s or 0
+        local d = (flat(pt(pts, idx)) - flat(pos)).Magnitude
+        if s < WAIT_TRIGGER_SPEED then
+            if idx < #pts then
+                local nextD = (flat(pt(pts, idx + 1)) - flat(pos)).Magnitude
+                if nextD < d then idx = idx + 1; continue end
+            end
+            break
+        end
+        if d < lookahead then idx = idx + 1 else break end
+    end
+    idxC = math.min(idx, #pts)
+    curV = pts[idxC].s or 0
+    distCur = (flat(pt(pts, idxC)) - flat(pos)).Magnitude
+
+    -- Direction
+    local dirVec = flat(pt(pts, idxC) - pos)
+    if dirVec.Magnitude < 0.1 then return end
+    local dir = dirVec.Unit
     local along = vel:Dot(dir)
 
-    -- 1) Car heading from its CFrame. The forward direction (in the part's local space) is learned
-    --    while driving straight, so any axis / yaw offset of the part is handled automatically.
+    -- Stall detection
+    if driveState == "normal" then
+        if speed < STALL_SPEED and curV > STALL_SPEED * 2 then
+            stallT = stallT + dt
+            if stallT > STALL_TIME then
+                driveState = "recovering"
+                recovery.phase = "reverse"; recovery.timer = REVERSE_TIME
+                recovery.cycle = 1; recovery.steerDir = 1; stallT = 0
+            end
+        else stallT = 0 end
+    end
+
+    if driveState == "recovering" then
+        recovery.timer = recovery.timer - dt
+        if recovery.phase == "reverse" then
+            setKey(KC.W, false); setKey(KC.S, true)
+            setKey(KC.A, recovery.steerDir > 0); setKey(KC.D, recovery.steerDir < 0)
+            label.Text = ("RECOVER %d REV %.1fs"):format(recovery.cycle, math.max(0, recovery.timer))
+        else
+            setKey(KC.S, false); setKey(KC.A, false); setKey(KC.D, false)
+            drivePWM(1.0, KC.W, KC.S)
+            label.Text = ("RECOVER %d FWD %.1fs"):format(recovery.cycle, math.max(0, recovery.timer))
+        end
+        dbg.Text = ("stuck wp %d | speed %.1f"):format(idxC, speed)
+        if recovery.timer <= 0 then
+            if recovery.phase == "reverse" then
+                recovery.phase = "forward"; recovery.timer = FORWARD_TIME
+            else
+                if speed > STALL_SPEED * 2 then driveState = "normal"; recovery.cycle = 0
+                elseif recovery.cycle >= MAX_RECOVERY_CYCLES then
+                    idx = math.min(idx + SKIP_AHEAD, #pts)
+                    driveState = "normal"; recovery.cycle = 0; stallT = 0
+                else
+                    recovery.cycle = recovery.cycle + 1
+                    recovery.phase = "reverse"; recovery.timer = REVERSE_TIME
+                    recovery.steerDir = -recovery.steerDir
+                end
+            end
+        end
+        return
+    end
+
+    -- Forward direction
     local forward, src
     if fwdLocal then
         forward = flat(part.CFrame:VectorToWorldSpace(fwdLocal))
         forward = forward.Magnitude > 0.01 and forward.Unit or nil
         src = "cf"
-        -- sanity check against the real direction of travel
         if forward and along > 6 and forward:Dot(vel.Unit) < 0.5 then forward, src = nil, nil end
     end
     if not forward then
-        if along > 3 then
-            forward, src = vel.Unit, "vel"
-        else
-            forward, src = unitOr(flat(part.CFrame.LookVector), dir), "look"
-        end
+        if along > 3 then forward, src = vel.Unit, "vel"
+        else forward, src = unitOr(flat(part.CFrame.LookVector), dir), "look" end
     end
 
-    -- 2) Yaw rate of that heading (positive = turning left)
-    local heading = math.atan2(-forward.X, -forward.Z)
-    if prevHeading and prevSrc == src and dt > 0 then
-        local d = (heading - prevHeading + math.pi) % (2 * math.pi) - math.pi
-        yawRate = yawRate * 0.5 + (d / dt) * 0.5
-    else
-        yawRate = 0
-    end
-    prevHeading, prevSrc = heading, src
-
-    -- 3) Learn the forward axis while driving straight toward the target
-    if along > 8 and along > speed * 0.9 and math.abs(yawRate) < 0.3 then
+    -- Yaw + steering
+    local rawYaw = part.AssemblyAngularVelocity.Y
+    if along > 8 and math.abs(rawYaw) < 0.3 then
         local rel = part.CFrame:VectorToObjectSpace(vel.Unit)
         local flatRel = Vector3.new(rel.X, 0, rel.Z)
         if flatRel.Magnitude > 0.7 then
@@ -544,70 +655,65 @@ local function driveStep(dt)
             fwdLocal = fwdLocal and unitOr(fwdLocal:Lerp(u, 0.1), u) or u
         end
     end
+    yawRate = yawRate * 0.7 + rawYaw * 0.3
+    local angle = math.atan2(forward:Cross(dir).Y, forward:Dot(dir))
+    local steerRaw = angle / STEER_FULL_ANGLE - STEER_LEAD * yawRate
+    steerSmooth = steerSmooth * STEER_SMOOTH + steerRaw * (1 - STEER_SMOOTH)
+    steerSmooth = math.clamp(steerSmooth, -1, 1)
+    if math.abs(steerSmooth) < STEER_DEADBAND then steerSmooth = 0 end
+    drivePWM(steerSmooth, KC.A, KC.D)
 
-    -- 4) Steering: match the car's heading to the direction of the route ahead.
-    --    Decisive proportional control (full lock at ~10 degrees of error) minus a lead term from the
-    --    current yaw rate, so it lets go of the key early enough to not overshoot.
-    local angle = math.atan2(forward:Cross(dir).Y, forward:Dot(dir)) -- positive = target on the left
-    local steer = math.clamp((angle / STEER_FULL_ANGLE - STEER_LEAD * yawRate) * 1.5, -1, 1)
-    if math.abs(steer) < 0.1 then steer = 0 end
-    drivePWM(steer, KC.A, KC.D) -- left = A, right = D
-    dbg.Text = ("heading:%s  err:%+.0fdeg  yaw:%+.2f rad/s  steer:%+.2f"):format(
-        src, math.deg(angle), yawRate, steer)
-
-    -- speed control on the signed speed: brake (S) ONLY while really moving toward the target
-    -- faster than wanted. If we are rolling backwards, the error is large and W is pressed instead.
-    local targetSpeed = pts[idx].s * SPEED_SCALE
-    local throttle = math.clamp((targetSpeed - along) / SPEED_RANGE, -1, 1)
-    if throttle < 0 and along < 3 then throttle = 0 end
-
-    -- anti-stall: if the car has been (almost) stopped for a while, floor it until it moves
-    if speed < STALL_SPEED then stallT += dt else stallT = 0 end
-    if stallT > STALL_TIME then throttle = 1 end
-
+    -- Throttle
+    local targetSpeed = curV * SPEED_SCALE
+    if curV < WAIT_TRIGGER_SPEED and distCur > WAIT_TRIGGER_RADIUS then
+        local nextS = 0
+        for j = idxC + 1, #pts do
+            local s = pts[j].s or 0
+            if s >= WAIT_TRIGGER_SPEED then nextS = s; break end
+        end
+        if nextS > 0 then
+            local t = math.clamp((distCur - WAIT_TRIGGER_RADIUS) / BRAKE_RANGE, 0, 1)
+            targetSpeed = nextS * t * SPEED_SCALE
+        end
+    end
+    local speedErr = targetSpeed - speed
+    local throttle
+    if speedErr > 0 then throttle = math.clamp(speedErr / SPEED_RANGE, 0, 1)
+    elseif along > 1 then throttle = math.clamp(speedErr / SPEED_RANGE, -1, 0)
+    elseif along < -1 then throttle = math.clamp(-along / SPEED_RANGE, 0, 1)
+    else throttle = 0 end
     drivePWM(throttle, KC.W, KC.S)
 
     local keys = (held[KC.W] and "W" or "-") .. (held[KC.A] and "A" or "-")
         .. (held[KC.S] and "S" or "-") .. (held[KC.D] and "D" or "-")
-    label.Text = ("DRIVE %d/%d | %.0f(%.0f)/%.0f studs/s | %.0f to end | %s | %s | %s"):format(
-        idx, #pts, along, speed, targetSpeed, distLast, keys,
-        isInCar() and "inCar" or "carUnknown", tostring(pathName))
+    label.Text = ("DRIVE %d/%d | spd %.0f/%.0f | al %+.0f | yaw %+.2f | str %+.2f | %s"):format(
+        idx, #pts, speed, targetSpeed, along, yawRate, steerSmooth, keys)
+    dbg.Text = ("heading:%s  err:%+.0fdeg  thr:%+.2f  curV:%.1f  dist:%.1f"):format(
+        src, math.deg(angle), throttle, curV, distCur)
 end
 
 local function walkStep(dt)
     local hum, root = getHumanoid(), getRoot()
     if not hum or not root then return end
-
     local walkPts = path.walk
     local pos = root.Position
-
-    -- skip waypoints already reached (the final one uses a tighter radius)
     while widx <= #walkPts do
         local reach = (widx == #walkPts) and 2.5 or WALK_REACH
         if (flat(pt(walkPts, widx)) - flat(pos)).Magnitude < reach then
-            widx += 1
-            walkTarget = nil
-        else
-            break
-        end
+            widx += 1; walkTarget = nil
+        else break end
     end
     if widx > #walkPts then return stop("Arrived at destination") end
-
-    -- only re-issue MoveTo when the target changes (or every second), so movement stays smooth
     local target = pt(walkPts, widx)
     if target ~= walkTarget or os.clock() - lastMoveTo > 1 then
         hum:MoveTo(target)
         if target ~= walkTarget then stuckT = 0 end
         walkTarget, lastMoveTo = target, os.clock()
     end
-
-    -- jump if blocked
     if flat(root.AssemblyLinearVelocity).Magnitude < 1 then
         stuckT += dt
-        if stuckT > 1.5 then hum.Jump = true stuckT = 0 end
-    else
-        stuckT = 0
-    end
+        if stuckT > 1.5 then hum.Jump = true; stuckT = 0 end
+    else stuckT = 0 end
     label.Text = ("WALK %d/%d | %s"):format(widx, #walkPts, tostring(pathName))
 end
 
@@ -618,20 +724,12 @@ local function wantSprint()
 end
 
 RunService.Heartbeat:Connect(function(dt)
-    setKey(KC.LeftShift, wantSprint()) -- hold SHIFT whenever you're out of the car
-
-    if phase == "drive" then
-        driveStep(dt)
-        refreshKeys()
-    elseif phase == "exiting" then
-        refreshKeys()
-    elseif phase == "walk" then
-        walkStep(dt)
-        refreshKeys()
-    end
+    setKey(KC.LeftShift, wantSprint())
+    if phase == "drive" then driveStep(dt); refreshKeys()
+    elseif phase == "exiting" then refreshKeys()
+    elseif phase == "walk" then walkStep(dt); refreshKeys() end
 end)
 
--- Auto-start: begin as soon as the script runs (waits until you are in a car if needed).
 if AUTO_START then
     task.spawn(function()
         if not game:IsLoaded() then game.Loaded:Wait() end
