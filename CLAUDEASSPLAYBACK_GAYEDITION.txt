@@ -37,7 +37,7 @@ local TOGGLE_KEY = Enum.KeyCode.F8
 local EXIT_KEY   = Enum.KeyCode.F
 local AUTO_START = true
 
-local BASE_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/BID_DRIVE_PATHS"
+local BASE_URL = "https://raw.githubusercontent.com/STINGERALTED333/crypt/main/HOST_DRIVE_PATHS"
 local FILE_EXT = ".txt"
 local MISS_LIMIT = 2
 local MAX_FILES  = 200
