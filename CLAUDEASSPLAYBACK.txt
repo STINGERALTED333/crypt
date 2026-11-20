@@ -28,7 +28,7 @@ end
 SpawnAsCar()
 
 task.wait(math.random(1,2))
--- Drive Player v7 — Reliable autopilot + Tabbed-Out fix
+-- Drive Player v8 — takeoff fix, smooth pure-pursuit steering, look-around recovery
 local env = (getgenv and getgenv()) or _G
 if env.__DrivePlayLoaded then return end
 env.__DrivePlayLoaded = true
@@ -50,23 +50,28 @@ local ALWAYS_EXIT_AT_END       = true
 
 -- Driving
 local SPEED_SCALE       = 1.0
-local LOOKAHEAD_MIN     = 10
+local LOOKAHEAD_MIN     = 16
 local LOOKAHEAD_MAX     = 40
 local LOOKAHEAD_SPEED   = 0.30
-local STEER_FULL_ANGLE  = math.rad(22)
-local STEER_LEAD        = 0.35
-local STEER_SMOOTH      = 0.6
+local STEER_FULL_ANGLE  = math.rad(35)  -- bigger = gentler steering
+local STEER_LEAD        = 0.25          -- yaw-rate damping
+local STEER_RATE        = 3.0           -- max steer change per second
 local STEER_DEADBAND    = 0.02
 local SPEED_RANGE       = 10
 local PWM_PERIOD        = 0.12
 local KEY_REFRESH       = 0.1
 
+local CREEP_SPEED = 6     -- min speed while approaching a stop point
+local BRAKE_DECEL = 15    -- studs/s^2, used to brake ahead of stop points
+
+-- Recovery
 local STALL_SPEED         = 2
 local STALL_TIME          = 1.5
 local REVERSE_TIME        = 1.0
 local FORWARD_TIME        = 2.0
 local MAX_RECOVERY_CYCLES = 3
 local SKIP_AHEAD          = 3
+local CAR_HALF_LEN        = 5
 
 -- Waits
 local WAIT_UNTIL_CAR_FULL = false -- Set true if you want it to wait for pawns
@@ -74,7 +79,6 @@ local MAX_PAWN_WAIT       = 90
 local WAIT_PER_WAYPOINT   = 0.5
 local WAIT_TRIGGER_SPEED  = 0.5
 local WAIT_TRIGGER_RADIUS = 6.0
-local BRAKE_RANGE         = 25
 
 local WALK_SIMPLIFY = 3
 local WALK_REACH    = 3
@@ -328,13 +332,59 @@ Instance.new("UICorner", dbg).CornerRadius = UDim.new(0, 6)
 
 local phase = "idle"
 local driveState = "normal"
-local recovery = { phase = "none", timer = 0, cycle = 0, steerDir = 1 }
+local recovery = { phase = "none", timer = 0, cycle = 0, steerDir = 1, canReverse = true, needScan = false, fwdSteer = 0 }
 local path, pathName
 local idx, widx = 1, 1
 local stuckT, stallT, waitT = 0, 0, 0
 local steerSmooth, yawRate = 0, 0
 local fwdLocal = nil
 local walkTarget, lastMoveTo = nil, 0
+
+-- === Raycast helpers (recovery "look around") ===
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+
+local function clearance(part, dirWorld, maxD)
+    local m = findCarModel(part) or part.Parent
+    rayParams.FilterDescendantsInstances = { LocalPlayer.Character, m }
+    local r = workspace:Raycast(part.Position + Vector3.new(0, 1.5, 0), dirWorld * maxD, rayParams)
+    return r and r.Distance or maxD
+end
+
+-- k=0 front, 1 front-left, 2 left, 3 rear-left, 4 rear, 5 rear-right, 6 right, 7 front-right
+local function scan(part, fwd)
+    local out = {}
+    for k = 0, 7 do
+        local d = CFrame.fromAxisAngle(Vector3.yAxis, math.rad(45 * k)):VectorToWorldSpace(fwd)
+        out[k] = clearance(part, d, 30)
+    end
+    return out
+end
+
+local function carForward(part, fallback)
+    local f = fwdLocal and flat(part.CFrame:VectorToWorldSpace(fwdLocal)) or flat(part.CFrame.LookVector)
+    return unitOr(f, fallback)
+end
+
+-- Pure-pursuit aim point: where the path crosses a circle of radius L around the car
+local function aimAt(pts, i, pos, L)
+    local p = flat(pos)
+    for j = math.max(i - 1, 1), #pts - 1 do
+        local a, b = flat(pt(pts, j)), flat(pt(pts, j + 1))
+        local d, f = b - a, a - p
+        local A = d:Dot(d)
+        if A > 1e-6 then
+            local B, C = 2 * f:Dot(d), f:Dot(f) - L * L
+            local disc = B * B - 4 * A * C
+            if disc >= 0 then
+                local t = (-B + math.sqrt(disc)) / (2 * A)
+                if t >= 0 and t <= 1 then return a + d * t end
+            end
+        end
+    end
+    return flat(pt(pts, math.min(i, #pts)))
+end
 
 local function stop(msg)
     dbg.Text = ""
@@ -382,6 +432,22 @@ local function exitCar()
     end)
 end
 
+-- Learn which local axis is the car's real "forward" by briefly holding W
+local function calibrateForward(part)
+    local t0 = os.clock()
+    setKey(KC.W, true)
+    while phase == "loading" and os.clock() - t0 < 1.5 do
+        task.wait(0.05)
+        local v = flat(part.AssemblyLinearVelocity)
+        if v.Magnitude > 4 then
+            local rel = part.CFrame:VectorToObjectSpace(v.Unit)
+            local f = Vector3.new(rel.X, 0, rel.Z)
+            if f.Magnitude > 0.7 then fwdLocal = f.Unit break end
+        end
+    end
+    setKey(KC.W, false)
+end
+
 local userStopped = false
 local function start()
     if phase ~= "idle" then return false end
@@ -399,7 +465,19 @@ local function start()
         local d = (flat(pt(path.drive, i)) - flat(pos)).Magnitude
         if d < bestD then best, bestD = i, d end
     end
+    -- if the nearest point is a stop we're not actually at, don't aim at it
+    while best < #path.drive
+        and (path.drive[best].s or 0) < WAIT_TRIGGER_SPEED
+        and (flat(pt(path.drive, best)) - flat(pos)).Magnitude > WAIT_TRIGGER_RADIUS do
+        best += 1
+    end
     idx = best
+
+    fwdLocal = nil
+    label.Text = "Calibrating heading..."
+    calibrateForward(part)
+    if phase ~= "loading" then return false end
+
     stallT, waitT, steerSmooth, yawRate = 0, 0, 0, 0
     driveState = "normal"; recovery.phase = "none"; recovery.timer = 0; recovery.cycle = 0
     phase = "drive"
@@ -490,33 +568,60 @@ local function driveStep(dt)
     curV = pts[idxC].s or 0
     distCur = (flat(pt(pts, idxC)) - flat(pos)).Magnitude
 
-    local dirVec = flat(pt(pts, idxC) - pos)
+    -- Smooth pure-pursuit aim (stop points are aimed at directly)
+    local aim = (curV < WAIT_TRIGGER_SPEED) and flat(pt(pts, idxC)) or aimAt(pts, idxC, pos, lookahead)
+    local dirVec = aim - flat(pos)
     if dirVec.Magnitude < 0.1 then return end
     local dir = dirVec.Unit
     local along = vel:Dot(dir)
 
+    -- === Stall detection + look-around recovery ===
     if driveState == "normal" then
-        if speed < STALL_SPEED and curV > STALL_SPEED * 2 then
-            stallT = stallT + dt
+        if speed < STALL_SPEED and distCur > WAIT_TRIGGER_RADIUS then
+            local fwdNow = carForward(part, dir)
+            local blocked = clearance(part, fwdNow, CAR_HALF_LEN + 3) < CAR_HALF_LEN + 1.5
+            stallT = stallT + dt * (blocked and 2.5 or 1)
             if stallT > STALL_TIME then
                 driveState = "recovering"
-                recovery.phase = "reverse"; recovery.timer = REVERSE_TIME
-                recovery.cycle = 1; recovery.steerDir = 1; stallT = 0
+                recovery.cycle = 1; stallT = 0
+                local s = scan(part, fwdNow)
+                recovery.canReverse = s[4] > CAR_HALF_LEN + 3
+                recovery.steerDir = (s[3] >= s[5]) and 1 or -1 -- tail swings toward the open side
+                recovery.phase = recovery.canReverse and "reverse" or "forward"
+                recovery.timer = recovery.canReverse and REVERSE_TIME or FORWARD_TIME
+                recovery.needScan = not recovery.canReverse
             end
         else stallT = 0 end
     end
 
     if driveState == "recovering" then
         recovery.timer = recovery.timer - dt
+        local fwdNow = carForward(part, dir)
+
         if recovery.phase == "reverse" then
             setKey(KC.W, false); setKey(KC.S, true)
             setKey(KC.A, recovery.steerDir > 0); setKey(KC.D, recovery.steerDir < 0)
+            -- stop reversing when something is right behind us
+            if clearance(part, -fwdNow, CAR_HALF_LEN + 4) < CAR_HALF_LEN + 1.5 then recovery.timer = 0 end
         else
-            setKey(KC.S, false); setKey(KC.A, false); setKey(KC.D, false)
-            drivePWM(1.0, KC.W, KC.S)
+            if recovery.needScan then
+                local s = scan(part, fwdNow)
+                local want = (math.atan2(fwdNow:Cross(dir).Y, fwdNow:Dot(dir)) >= 0) and 1 or -1
+                local left, right = math.min(s[1], s[2]), math.min(s[7], s[6])
+                local wantOpen = (want == 1) and left or right
+                local otherOpen = (want == 1) and right or left
+                recovery.fwdSteer = (wantOpen > CAR_HALF_LEN + 4 or wantOpen >= otherOpen) and want or -want
+                recovery.needScan = false
+            end
+            setKey(KC.S, false)
+            setKey(KC.A, recovery.fwdSteer > 0); setKey(KC.D, recovery.fwdSteer < 0)
+            setKey(KC.W, true)
+            if clearance(part, fwdNow, CAR_HALF_LEN + 2) < CAR_HALF_LEN + 0.5 then recovery.timer = 0 end
         end
+
         if recovery.timer <= 0 then
-            if recovery.phase == "reverse" then recovery.phase = "forward"; recovery.timer = FORWARD_TIME
+            if recovery.phase == "reverse" then
+                recovery.phase = "forward"; recovery.timer = FORWARD_TIME; recovery.needScan = true
             else
                 if speed > STALL_SPEED * 2 then driveState = "normal"; recovery.cycle = 0
                 elseif recovery.cycle >= MAX_RECOVERY_CYCLES then
@@ -529,9 +634,11 @@ local function driveStep(dt)
                 end
             end
         end
+        label.Text = ("RECOVER %s cyc %d"):format(recovery.phase, recovery.cycle)
         return
     end
 
+    -- === Heading ===
     local forward, src
     if fwdLocal then
         forward = flat(part.CFrame:VectorToWorldSpace(fwdLocal))
@@ -553,25 +660,30 @@ local function driveStep(dt)
             fwdLocal = fwdLocal and unitOr(fwdLocal:Lerp(u, 0.1), u) or u
         end
     end
+
+    -- === Steering: speed-scaled gain, yaw damping, rate limit ===
     yawRate = yawRate * 0.7 + rawYaw * 0.3
     local angle = math.atan2(forward:Cross(dir).Y, forward:Dot(dir))
-    local steerRaw = angle / STEER_FULL_ANGLE - STEER_LEAD * yawRate
-    steerSmooth = steerSmooth * STEER_SMOOTH + steerRaw * (1 - STEER_SMOOTH)
+    local speedFactor = 1 / (1 + speed / 40)
+    local steerRaw = (angle / STEER_FULL_ANGLE) * speedFactor - STEER_LEAD * yawRate
+    local maxStep = STEER_RATE * dt
+    steerSmooth = steerSmooth + math.clamp(steerRaw - steerSmooth, -maxStep, maxStep)
     steerSmooth = math.clamp(steerSmooth, -1, 1)
     if math.abs(steerSmooth) < STEER_DEADBAND then steerSmooth = 0 end
 
-    local targetSpeed = curV * SPEED_SCALE
-    if curV < WAIT_TRIGGER_SPEED and distCur > WAIT_TRIGGER_RADIUS then
-        local nextS = 0
-        for j = idxC + 1, #pts do
-            local s = pts[j].s or 0
-            if s >= WAIT_TRIGGER_SPEED then nextS = s; break end
-        end
-        if nextS > 0 then
-            local t = math.clamp((distCur - WAIT_TRIGGER_RADIUS) / BRAKE_RANGE, 0, 1)
-            targetSpeed = nextS * t * SPEED_SCALE
+    -- === Target speed: creep to stop points, brake ahead of them ===
+    local targetSpeed = (curV < WAIT_TRIGGER_SPEED) and CREEP_SPEED or curV * SPEED_SCALE
+    for j = idxC, #pts do
+        local ahead = distCur + (path.cum[j] - path.cum[idxC])
+        if ahead > 120 then break end
+        if (pts[j].s or 0) < WAIT_TRIGGER_SPEED then
+            local room = math.max(ahead - WAIT_TRIGGER_RADIUS * 0.5, 0)
+            local cap = math.sqrt(2 * BRAKE_DECEL * room)
+            targetSpeed = math.min(targetSpeed, math.max(cap, CREEP_SPEED))
+            break
         end
     end
+
     local speedErr = targetSpeed - speed
     local throttle
     if speedErr > 0 then throttle = math.clamp(speedErr / SPEED_RANGE, 0, 1)
@@ -580,11 +692,14 @@ local function driveStep(dt)
     else throttle = 0 end
 
     -- === TABBED OUT FIX ===
-    -- When unfocused, os.clock() stutters and breaks PWM. 
-    -- Bypass PWM and just hold the keys down directly.
+    -- When unfocused, os.clock() stutters and breaks PWM, so hold keys directly,
+    -- but with hysteresis so tiny steering errors don't flip full lock.
     if not UserInput.WindowFocused then
-        setKey(KC.A, steerSmooth > 0)
-        setKey(KC.D, steerSmooth < 0)
+        local s = steerSmooth
+        local aOn = (held[KC.A] and s > 0.15) or s > 0.35
+        local dOn = (held[KC.D] and s < -0.15) or s < -0.35
+        setKey(KC.A, aOn)
+        setKey(KC.D, dOn)
         setKey(KC.W, throttle > 0.1)
         setKey(KC.S, throttle < -0.1)
     else
